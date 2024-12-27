@@ -30,11 +30,18 @@
 
 // Hacked by Earle Philhower to work with the Arduino-Pico core
 
-#include <psram_board.h>
+#include <../../psram_board.h>
 
-#define RP2350_PSRAM_CS PIMORONI_PICO_PLUS2_PSRAM_CS_PIN
 
-//#ifdef RP2350_PSRAM_CS
+//#define PIMORONI_PICO_PLUS2_PSRAM_CS_PIN 47
+//#define RP2350_PSRAM_CS PIMORONI_PICO_PLUS2_PSRAM_CS_PIN
+#define RP2350_PSRAM_CS 47
+#define PSRAM_HEAP 0
+
+
+#ifdef RP2350_PSRAM_CS
+
+#include <stdio.h>
 
 #include <hardware/address_mapped.h>
 #include <hardware/clocks.h>
@@ -45,11 +52,12 @@
 #include <hardware/structs/xip_ctrl.h>
 #include <pico/runtime_init.h>
 
+#if PSRAM_HEAP
 // Include TLSF in this compilation unit
 #include "tlsf/tlsf.c"
+
 static tlsf_t _mem_heap = nullptr;
 static pool_t _mem_psram_pool = nullptr;
-
 // PSRAM heap minus PSRAM global/static variables from the linker
 /*
 extern "C" {
@@ -58,13 +66,18 @@ extern "C" {
 }
 */
 #define __psram_start__ 0x11000000
-#define __psram_heap_start__ 0x11000000
+uint32_t __psram_heap_start__;
+
 // PSRAM Start : 0x11000000
 // Heap Start : + 4096
 
 static bool _bInitalized = false;
-size_t ps_size = 0;
 size_t ps_heap_size = 0;
+#endif  //PSRAM_HEAP
+size_t ps_size = 0;
+
+//#define RP2350_PSRAM_MAX_SELECT_FS64 (100'000'000)
+//#define RP2350_PSRAM_MAX_SCK_HZ (100'000'000)
 
 #define PICO_RUNTIME_INIT_PSRAM "11001" // Towards the end, after alarms
 
@@ -135,7 +148,7 @@ const uint8_t PSRAM_ID = RP2350_PSRAM_ID;
 /// @note This function expects the CS pin set
 static size_t __no_inline_not_in_flash_func(get_psram_size)(void) {
     size_t psram_size = 0;
-    uint32_t intr_stash = save_and_disable_interrupts();
+//    uint32_t intr_stash = save_and_disable_interrupts();
 
     // Try and read the PSRAM ID via direct_csr.
     qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
@@ -195,7 +208,7 @@ static size_t __no_inline_not_in_flash_func(get_psram_size)(void) {
             psram_size *= 4;
         }
     }
-    restore_interrupts(intr_stash);
+//    restore_interrupts(intr_stash);
     return psram_size;
 }
 //-----------------------------------------------------------------------------
@@ -211,7 +224,7 @@ static void __no_inline_not_in_flash_func(set_psram_timing)(void) {
     // the PSRAM IC can handle - which is defined in SFE_PSRAM_MAX_SCK_HZ
     volatile uint8_t clockDivider = (sysHz + SFE_PSRAM_MAX_SCK_HZ - 1) / SFE_PSRAM_MAX_SCK_HZ;
 
-    uint32_t intr_stash = save_and_disable_interrupts();
+//    uint32_t intr_stash = save_and_disable_interrupts();
 
     // Get the clock femto seconds per cycle.
 
@@ -227,15 +240,28 @@ static void __no_inline_not_in_flash_func(set_psram_timing)(void) {
 
     volatile uint8_t minDeselect = (SFE_PSRAM_MIN_DESELECT_FS + fsPerCycle - 1) / fsPerCycle;
 
-    // printf("Max Select: %d, Min Deselect: %d, clock divider: %d\n", maxSelect, minDeselect, clockDivider);
+// Adjust / Test
+// https://forums.raspberrypi.com/viewtopic.php?t=375975
+// For Flash (Same with PSRAM ? )
+//2 = RXDELAY (you have to be careful, usually for QSPI>100MHz it works with RXDELAY= CLKDIV)
+//4 = CLKDIV (can be 1,2,3,4,... in contrast with 2040 which accepst only odd values 2,4,6 ...)
+
+    volatile uint8_t cooldown = 1;
+    volatile uint8_t rxdelay = 1;
+
+    if (sysHz>266000000) rxdelay = 3;
+
+   printf("System Clk %d, cooldown %d, rxdelay %d, Max Select: %d, Min Deselect: %d, clock divider: %d\n ",sysHz,cooldown,rxdelay,maxSelect,minDeselect,clockDivider);
 
     qmi_hw->m[1].timing = QMI_M1_TIMING_PAGEBREAK_VALUE_1024 << QMI_M1_TIMING_PAGEBREAK_LSB | // Break between pages.
                           3 << QMI_M1_TIMING_SELECT_HOLD_LSB | // Delay releasing CS for 3 extra system cycles.
-                          1 << QMI_M1_TIMING_COOLDOWN_LSB | 1 << QMI_M1_TIMING_RXDELAY_LSB |
-                          maxSelect << QMI_M1_TIMING_MAX_SELECT_LSB | minDeselect << QMI_M1_TIMING_MIN_DESELECT_LSB |
+                          cooldown  << QMI_M1_TIMING_COOLDOWN_LSB |
+                          rxdelay   << QMI_M1_TIMING_RXDELAY_LSB |
+                          maxSelect << QMI_M1_TIMING_MAX_SELECT_LSB |
+                          minDeselect << QMI_M1_TIMING_MIN_DESELECT_LSB |
                           clockDivider << QMI_M1_TIMING_CLKDIV_LSB;
 
-    restore_interrupts(intr_stash);
+//    restore_interrupts(intr_stash);
 }
 
 
@@ -243,7 +269,7 @@ static void __no_inline_not_in_flash_func(set_psram_timing)(void) {
 /// @brief The setup_psram function - note that this is not in flash
 ///
 /// Fail if ps_size=0
-static void __no_inline_not_in_flash_func(setup_psram)() 
+void __no_inline_not_in_flash_func(setup_psram)(bool useheap,uint32_t heapstart) 
 {
     // Set the PSRAM CS pin in the SDK
     gpio_set_function(RP2350_PSRAM_CS, GPIO_FUNC_XIP_CS1);
@@ -256,7 +282,7 @@ static void __no_inline_not_in_flash_func(setup_psram)()
         return;
     }
 
-    uint32_t intr_stash = save_and_disable_interrupts();
+//    uint32_t intr_stash = save_and_disable_interrupts();
     // Enable quad mode.
     qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
 
@@ -281,7 +307,7 @@ static void __no_inline_not_in_flash_func(setup_psram)()
         }
         qmi_hw->direct_csr &= ~(QMI_DIRECT_CSR_ASSERT_CS1N_BITS);
         for (size_t j = 0; j < 20; j++) {
-            asm("nop");
+            asm("nop");     // Maybe need to be changed if bigger overclocking
         }
 
         (void)qmi_hw->direct_rx;
@@ -291,11 +317,11 @@ static void __no_inline_not_in_flash_func(setup_psram)()
     qmi_hw->direct_csr &= ~(QMI_DIRECT_CSR_ASSERT_CS1N_BITS | QMI_DIRECT_CSR_EN_BITS);
 
     // check our interrupts and setup the timing
-    restore_interrupts(intr_stash);
+//    restore_interrupts(intr_stash);
     set_psram_timing();
 
     // and now stash interrupts again
-    intr_stash = save_and_disable_interrupts();
+//    intr_stash = save_and_disable_interrupts();
 
     qmi_hw->m[1].rfmt = (QMI_M1_RFMT_PREFIX_WIDTH_VALUE_Q << QMI_M1_RFMT_PREFIX_WIDTH_LSB |
                          QMI_M1_RFMT_ADDR_WIDTH_VALUE_Q << QMI_M1_RFMT_ADDR_WIDTH_LSB |
@@ -322,12 +348,17 @@ static void __no_inline_not_in_flash_func(setup_psram)()
     // Mark that we can write to PSRAM.
     xip_ctrl_hw->ctrl |= XIP_CTRL_WRITABLE_M1_BITS;
 
-    restore_interrupts(intr_stash);
+//    restore_interrupts(intr_stash);
 
     ps_size = psram_size;
-
-    uint32_t used_psram_size = &__psram_heap_start__ - &__psram_start__;
-    ps_heap_size = ps_size - used_psram_size;
+#if PSRAM_HEAP
+    if (useheap)        // if useheap is false, heap is not initializes as ps_heap_size=0
+    {
+     __psram_heap_start__=__psram_start__+heapstart;    
+     uint32_t used_psram_size = __psram_heap_start__ - __psram_start__;
+     ps_heap_size = ps_size - used_psram_size;
+    }
+#endif    
 }
 
 // update timing -- used if the system clock/timing was changed.
@@ -335,6 +366,7 @@ void psram_reinit_timing() {
     set_psram_timing();
 }
 
+#if PSRAM_HEAP
 static bool ps_heap_init() {
     if (_bInitalized) {
         return true;
@@ -345,7 +377,8 @@ static bool ps_heap_init() {
     }
     _mem_heap = NULL;
     _mem_psram_pool = NULL;
-    _mem_heap = tlsf_create_with_pool((void *)&__psram_heap_start__, __psram_heap_size, 16 * 1024 * 1024);
+    //_mem_heap = tlsf_create_with_pool((void *)__psram_heap_start__, ps_heap_size, 16 * 1024 * 1024);
+    _mem_heap = tlsf_create_with_pool((void *)__psram_heap_start__, ps_heap_size);
     if (!_mem_heap) {
         return false;
     }
@@ -403,7 +436,7 @@ size_t ps_largest_free_block() {
     }
     size_t max_free = 0;
     if (_mem_psram_pool) {
-        tlsf_walk_pool(_mem_psram_pool, max_free_walker, &max_free);
+        tlsf_walk_pool(_mem_psram_pool, (tlsf_walker) max_free_walker, &max_free);
     }
     return max_free;
 }
@@ -419,7 +452,7 @@ size_t ps_total_space() {
     }
     size_t total_size = 0;
     if (_mem_psram_pool) {
-        tlsf_walk_pool(_mem_psram_pool, memory_size_walker, &total_size);
+        tlsf_walk_pool(_mem_psram_pool, (tlsf_walker) memory_size_walker, &total_size);
     }
     return total_size;
 }
@@ -437,9 +470,10 @@ size_t ps_total_used() {
     }
     size_t total_size = 0;
     if (_mem_psram_pool) {
-        tlsf_walk_pool(_mem_psram_pool, memory_used_walker, &total_size);
+        tlsf_walk_pool(_mem_psram_pool, (tlsf_walker) memory_used_walker, &total_size);
     }
     return total_size;
 }
+#endif
 
-//#endif // RP2350_PSRAM_CS
+#endif // RP2350_PSRAM_CS
